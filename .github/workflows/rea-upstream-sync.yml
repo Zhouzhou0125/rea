@@ -6,8 +6,10 @@ on:
     - cron: '23 22 * * *'
   workflow_dispatch:
 
-permissions:
-  contents: write
+# The default GITHUB_TOKEN cannot synchronize changes to workflow files.
+# REA_SYNC_TOKEN is a fine-grained PAT limited to this repository, with
+# Contents and Workflows read/write. Its value belongs only in Actions secrets.
+permissions: {}
 
 concurrency:
   group: rea-upstream-sync
@@ -22,10 +24,15 @@ jobs:
       - name: Verify the fork and merge official updates
         shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.REA_SYNC_TOKEN }}
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo '::error::REA_SYNC_TOKEN is missing. Add a repository-scoped fine-grained PAT with Contents and Workflows read/write to Actions secrets.'
+            echo 'Synchronization blocked: REA_SYNC_TOKEN has not been configured.' >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
           gh api "repos/$GH_REPO" > fork.json
           jq -e '.fork == true and .parent.full_name == "morluto/rea" and .default_branch == "main"' fork.json > /dev/null
           # GitHub reports conflicts as a nonzero exit. Never force-push or reset.
