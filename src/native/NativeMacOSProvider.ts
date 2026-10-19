@@ -1,7 +1,8 @@
 import {
   plistSourceFormat,
   requireRegularPlist,
-  nativePlistFileFailure,
+  nativePlistFailure,
+  resolveNativePlistSelection,
   unreadablePlist,
 } from "./NativePlistSource.js";
 import { bindArtifactFileCleanup } from "../artifacts/ArtifactFileOperation.js";
@@ -21,8 +22,7 @@ import {
 import { NativeUiCleanupError } from "./NativeUiCleanupError.js";
 import { LldbCallTracer, type NativeCallTracer } from "./LldbCallTracer.js";
 import { observeNativeCalls } from "./NativeCallObservation.js";
-import { basename, dirname, isAbsolute, resolve } from "node:path";
-import { realpath, stat } from "node:fs/promises";
+import { realpath } from "node:fs/promises";
 
 import { z } from "zod";
 
@@ -64,9 +64,9 @@ import { jsonValueSchema, type JsonValue } from "../domain/jsonValue.js";
 import {
   projectPlistValue,
   nonFiniteRealLimitation,
-  unknownRealLimitation,
   negativeZeroRealLimitation,
   unknownDateLimitation,
+  unknownScalarLimitation,
 } from "../domain/apple/plistValue.js";
 import { createPlistNumberProjection } from "../domain/apple/plistNumbers.js";
 import type { NativeUiObservationResult } from "../domain/native/nativeUiObservation.js";
@@ -118,6 +118,7 @@ import {
   createNativeUiHelperRuntime,
   type NativeUiHelperRuntime,
 } from "./NativeUiHelperRuntime.js";
+import { NativeUiInterruptionControl } from "./NativeUiInterruptionControl.js";
 
 type SignatureRuntimeRootFactory = () => Promise<
   Pick<PrivateRuntimeRoot, "path" | "close">
@@ -362,57 +363,57 @@ class NativeMacOSClient implements AnalysisClient {
           this.#nativeUiCleanupFailure(earlierCleanupFailures, operation),
         );
       const runtime = createNativeUiHelperRuntime(this.environment);
-      const observationSignal =
-        signal === undefined
-          ? runtime.signal
-          : AbortSignal.any([signal, runtime.signal]);
-      this.#pendingNativeUiRuntimes.add(runtime);
-      let result: Awaited<ReturnType<typeof observeNativeUi>>;
+      const interruption = new NativeUiInterruptionControl(
+        signal,
+        runtime.signal,
+      );
       try {
-        result = await observeNativeUi(this.target, operation, parameters, {
-          environment: this.environment,
-          signal: observationSignal,
-          runtime,
-        });
-      } catch (cause: unknown) {
-        result = err(
-          cause instanceof AnalysisError
-            ? cause
-            : new ProviderAdapterError(IDENTITY.id, operation, { cause }),
-        );
+        this.#pendingNativeUiRuntimes.add(runtime);
+        let result: Awaited<ReturnType<typeof observeNativeUi>>;
+        try {
+          result = await observeNativeUi(this.target, operation, parameters, {
+            environment: this.environment,
+            runtime,
+            interruption,
+          });
+        } catch (cause: unknown) {
+          result = err(
+            cause instanceof AnalysisError
+              ? cause
+              : new ProviderAdapterError(IDENTITY.id, operation, { cause }),
+          );
+        }
+        try {
+          await runtime.close();
+          this.#pendingNativeUiRuntimes.delete(runtime);
+        } catch (cause: unknown) {
+          result = finishNativeUiObservation(result, operation, interruption);
+          const cleanup = this.#nativeUiCleanupFailure(
+            [{ runtime, cause }],
+            operation,
+            result.ok ? result.value : undefined,
+          );
+          return err(
+            result.ok
+              ? cleanup
+              : analysisErrorWithCleanupFailure(
+                  result.error,
+                  cleanup,
+                  operation,
+                ).bindCleanupDependencies([result.error, cleanup]),
+          );
+        }
+        result = finishNativeUiObservation(result, operation, interruption);
+        return result.ok
+          ? ok(
+              createAnalysisExecution(result.value, IDENTITY, {
+                limitations: result.value.limitations,
+              }),
+            )
+          : result;
+      } finally {
+        interruption.dispose();
       }
-      try {
-        await runtime.close();
-        this.#pendingNativeUiRuntimes.delete(runtime);
-      } catch (cause: unknown) {
-        result = finishNativeUiObservation(
-          result,
-          operation,
-          observationSignal,
-        );
-        const cleanup = this.#nativeUiCleanupFailure(
-          [{ runtime, cause }],
-          operation,
-          result.ok ? result.value : undefined,
-        );
-        return err(
-          result.ok
-            ? cleanup
-            : analysisErrorWithCleanupFailure(
-                result.error,
-                cleanup,
-                operation,
-              ).bindCleanupDependencies([result.error, cleanup]),
-        );
-      }
-      result = finishNativeUiObservation(result, operation, observationSignal);
-      return result.ok
-        ? ok(
-            createAnalysisExecution(result.value, IDENTITY, {
-              limitations: result.value.limitations,
-            }),
-          )
-        : result;
     });
   }
 
@@ -790,11 +791,13 @@ class NativeMacOSClient implements AnalysisClient {
     try {
       return await this.#plistResources.run(async () => {
         try {
-          const plist = await resolvePlistPath(this.target, requested);
+          const plist = await resolveNativePlistSelection(
+            this.target,
+            requested,
+          );
           if (!plist.ok) return plist;
           const fileInput = {
-            path: plist.value,
-            requested,
+            selection: plist.value,
             resources: this.#plistResources,
             signal,
           };
@@ -803,14 +806,14 @@ class NativeMacOSClient implements AnalysisClient {
           const classified = await this.#run(
             "inspect_plist",
             "file",
-            ["-b", plist.value],
+            ["-b", plist.value.path],
             { signal },
           );
           if (!classified.ok) return classified;
           const json = await this.#run(
             "inspect_plist",
             "plutil",
-            ["-convert", "json", "-o", "-", "--", plist.value],
+            ["-convert", "json", "-o", "-", "--", plist.value.path],
             { signal, acceptNonZero: true },
           );
           if (!json.ok) return json;
@@ -825,7 +828,7 @@ class NativeMacOSClient implements AnalysisClient {
               : await this.#run(
                   "inspect_plist",
                   "plutil",
-                  ["-convert", "xml1", "-o", "-", "--", plist.value],
+                  ["-convert", "xml1", "-o", "-", "--", plist.value.path],
                   { signal, acceptNonZero: !jsonDecoded },
                 );
           if (xml !== undefined && !xml.ok) return xml;
@@ -834,8 +837,7 @@ class NativeMacOSClient implements AnalysisClient {
             return err(
               unreadablePlist(
                 plist.value,
-                requested,
-                `plutil could not decode it as a property list (${plutilDiagnostic(capture, plist.value)})`,
+                `plutil could not decode it as a property list (${plutilDiagnostic(capture, plist.value.path)})`,
                 {
                   capturedOutput: {
                     stdout: capture.stdout,
@@ -861,7 +863,7 @@ class NativeMacOSClient implements AnalysisClient {
             classified.value,
             json.value,
             ...(xml === undefined ? [] : [xml.value]),
-          ].map((item) => invocation(item, plist.value, "$PLIST"));
+          ].map((item) => invocation(item, plist.value.path, "$PLIST"));
           const converted = xml?.value ?? json.value;
           const format = await plistSourceFormat(classified.value.stdout, {
             ...fileInput,
@@ -880,14 +882,14 @@ class NativeMacOSClient implements AnalysisClient {
             format: format.value,
             value: parsed.value.value,
             bundle: parsed.value.bundle,
-            source_path: plist.value,
+            source_path: plist.value.path,
             provenance,
             limitations: parsed.value.limitations,
           });
           return ok({
             result: jsonValueSchema.parse(result),
             limitations: parsed.value.limitations,
-            locations: [{ kind: "artifact-path", path: plist.value }],
+            locations: [{ kind: "artifact-path", path: plist.value.path }],
           });
         } catch (cause: unknown) {
           // Producer failures stay opaque; only scope admission failures reach the file mapper.
@@ -895,9 +897,7 @@ class NativeMacOSClient implements AnalysisClient {
         }
       });
     } catch (cause: unknown) {
-      return err(
-        nativePlistFileFailure(cause, requested ?? this.target.path, requested),
-      );
+      return err(nativePlistFailure(cause, undefined));
     }
   }
 
@@ -1244,15 +1244,15 @@ const parseEntitlements = (
       ...(projected.nonFiniteRealCount === 0
         ? []
         : [nonFiniteRealLimitation(projected.nonFiniteRealCount)]),
-      ...(projected.unknownRealCount === 0
-        ? []
-        : [unknownRealLimitation(projected.unknownRealCount)]),
       ...(projected.negativeZeroRealCount === 0
         ? []
         : [negativeZeroRealLimitation(projected.negativeZeroRealCount)]),
       ...(projected.unknownDateCount === 0
         ? []
         : [unknownDateLimitation(projected.unknownDateCount)]),
+      ...(projected.unknownScalarCount === 0
+        ? []
+        : [unknownScalarLimitation(projected.unknownScalarCount)]),
     ],
   };
 };
@@ -1271,39 +1271,4 @@ const plutilDiagnostic = (
   return diagnostics.length === 0
     ? "plutil printed no diagnostic"
     : diagnostics.join("\n");
-};
-
-/** The bundle whose Contents/MacOS directory directly holds `path`. */
-const macOSBundleRoot = (path: string): string | undefined => {
-  const programs = dirname(path);
-  const contents = dirname(programs);
-  return basename(programs) === "MacOS" && basename(contents) === "Contents"
-    ? dirname(contents)
-    : undefined;
-};
-
-const resolvePlistPath = async (
-  target: BinaryTarget,
-  requested: string | undefined,
-): Promise<Result<string, AnalysisError>> => {
-  try {
-    const source = target.sourcePath ?? target.path;
-    if (requested !== undefined && isAbsolute(requested))
-      return ok(resolve(requested));
-    const sourceMetadata = await stat(source);
-    const root = sourceMetadata.isDirectory()
-      ? source
-      : (macOSBundleRoot(target.path) ?? dirname(target.path));
-    if (requested !== undefined) return ok(resolve(root, requested));
-    // A selected plist file is itself the plist to inspect.
-    if (target.kind === "artifact" && target.format === "plist")
-      return ok(target.path);
-    // A bundle target records the Info.plist its program file was declared
-    // in: Contents/Info.plist, or the root plist of an iOS-style bundle.
-    return ok(target.bundleInfoPlist ?? resolve(root, "Contents/Info.plist"));
-  } catch (cause: unknown) {
-    return err(
-      new ProviderAdapterError(IDENTITY.id, "inspect_plist", { cause }),
-    );
-  }
 };
