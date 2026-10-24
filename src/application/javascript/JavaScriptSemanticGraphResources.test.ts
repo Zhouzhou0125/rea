@@ -5,6 +5,7 @@ import { buildJavaScriptSemanticGraph } from "./JavaScriptSemanticGraphBuilder.j
 import type { JavaScriptArtifactAnalysis } from "./JavaScriptArtifactAnalysisTypes.js";
 import { queryJavaScriptSemanticGraph } from "../../domain/javascript/javascriptSemanticQuery.js";
 import { resolveJavaScriptSemanticEvidence } from "../../domain/javascript/javascriptSemanticGraph.js";
+import { JavaScriptJsonDocuments } from "./JavaScriptJsonDocuments.js";
 
 const SHA256 = "a".repeat(64);
 const GRAPH_ID = `jag_${"b".repeat(64)}`;
@@ -289,12 +290,56 @@ it("projects literal seeds and static object flow", () => {
     direction: "forward-influence",
   });
   expect(literal.status).toBe("ambiguous");
-  expect(literal.summary.total_seed_matches).toBe(3);
+  const targetName = (targetId: string): string => {
+    const target = graph.nodes.find(({ node_id }) => node_id === targetId);
+    if (target === undefined) throw new Error("Missing value target");
+    if (target.kind === "binding" && target.label !== null) return target.label;
+    const owner = graph.relations.find(
+      ({ relation, target_node_id }) =>
+        relation === "writes-property" && target_node_id === target.node_id,
+    );
+    const binding = graph.nodes.find(
+      ({ node_id }) => node_id === owner?.source_node_id,
+    );
+    if (binding === undefined) throw new Error("Missing property owner");
+    return `${binding.label}.${String(target.properties.name)}`;
+  };
+  const literalTargets = graph.relations
+    .filter(
+      ({ relation, source_node_id }) =>
+        relation === "defines" &&
+        literal.seed_node_ids.includes(source_node_id),
+    )
+    .map(({ target_node_id }) => targetName(target_node_id));
+  expect(literalTargets.sort()).toEqual([
+    "copy.token",
+    "read",
+    "source.token",
+    "token",
+  ]);
+  expect(literal.summary.total_seed_matches).toBe(literalTargets.length);
   const property = queryJavaScriptSemanticGraph(graph, {
     seed: { kind: "property", name: "token" },
     direction: "forward-influence",
   });
-  expect(property.status).toBe("found");
+  expect(property.status).toBe("ambiguous");
+  expect(property.seed_node_ids.map(targetName).sort()).toEqual([
+    "copy.token",
+    "source.token",
+  ]);
+  expect(property.unknowns).toEqual([]);
+  expect(property.relations).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({
+        relation: "destructures",
+        resolution: "resolved",
+      }),
+      expect.objectContaining({
+        relation: "reads-property",
+        resolution: "resolved",
+      }),
+    ]),
+  );
 });
 
 it("does not promote transformed return expressions to resolved aliases", () => {
@@ -347,6 +392,7 @@ it("uses unavailable evidence when no source produced semantic IR", () => {
 });
 
 const emptyAnalysis = (): JavaScriptArtifactAnalysis => ({
+  jsonDocuments: new JavaScriptJsonDocuments(),
   files: [],
   packages: [],
   json_modules: [],
