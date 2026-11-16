@@ -1,6 +1,6 @@
 import { javaClassFile } from "../../fixtures/javaClassFile.js";
 import { Il2cppBinaryFormatFailure } from "../../../src/il2cpp/Il2cppBinaryFormat.js";
-import { readBinaryContainer } from "../../../src/native/metadata/readBinaryContainer.js";
+import { readBinaryContainer } from "../../../src/domain/native/readBinaryContainer.js";
 import {
   openImageSteps,
   readUInt32,
@@ -54,6 +54,7 @@ const expectedAddress = (value: bigint | "no-body" | "unknown") =>
       }
     : { state: value, address: null, rva: null };
 const expectedAddresses = FIXTURE_METHOD_ADDRESSES.map(expectedAddress);
+
 // The provider selects a universal slice before linking, as here.
 const link = (bytes: Buffer, architecture?: Il2cppBinaryArchitecture) =>
   linkIl2cppBinary(
@@ -66,6 +67,26 @@ const link = (bytes: Buffer, architecture?: Il2cppBinaryArchitecture) =>
     metadata,
     facts,
   );
+it.each([183, 62])(
+  "links past unrelated ABS64 and GLOB_DAT records on ELF machine %d",
+  (machine) => {
+    const bytes = createElfFixture(createIl2cppBinaryFixture(), {
+      machine,
+      symbolDefinition: { value: FIXTURE_BINARY_BASE + 0xe00n },
+      unresolvedRelocations: [
+        ...[0xe00, 0xe08, 0xe10].map((offset) => ({
+          offset,
+          kind: machine === 183 ? 257 : 1,
+        })),
+        ...[0xe20, 0xe28, 0xe30].map((offset) => ({
+          offset,
+          kind: machine === 183 ? 1025 : 6,
+        })),
+      ],
+    });
+    expect(link(bytes).method_addresses).toEqual(expectedAddresses);
+  },
+);
 // A type-table fallback needs the metadata to reference most of the table, as
 // real builds do; referencing type 3 requires all four fixture entries.
 const wholeTable = {
@@ -447,10 +468,16 @@ it("refuses an image name repeated past the search bound", () => {
   // The Mach-O segment covers the original size; widen it to the new tail.
   flooded.writeBigUInt64LE(BigInt(flooded.length), 64);
   flooded.writeBigUInt64LE(BigInt(flooded.length), 80);
-  expect(failure(flooded)).toEqual({
-    reason: "native-index-capacity",
-    kind: "capacity",
-  });
+  expect(() => link(flooded)).toThrow(
+    expect.objectContaining({
+      reason: "native-index-capacity",
+      failure: expect.objectContaining({
+        kind: "limit",
+        format: "il2cpp-binary",
+        limit: { name: "native-index-capacity", maximum: 65536 },
+      }),
+    }),
+  );
 });
 
 it.each([
@@ -1970,6 +1997,8 @@ it("keeps a capacity refusal while naming a generic row a refusal", () => {
               throw new Il2cppBinaryFormatFailure(
                 "native-type-text-capacity",
                 "budget",
+                1,
+                "bytes",
               );
             tableChecked = bytes === 3 * minimumGenericRow;
           },
@@ -1982,7 +2011,10 @@ it("keeps a capacity refusal while naming a generic row a refusal", () => {
   })();
   expect(tableChecked).toBe(true);
   expect(failure).toBeInstanceOf(Il2cppBinaryFormatFailure);
-  expect((failure as Il2cppBinaryFormatFailure).kind).toBe("capacity");
+  expect((failure as Il2cppBinaryFormatFailure).failure).toMatchObject({
+    kind: "limit",
+    limit: { name: "native-type-text-capacity", maximum: 1 },
+  });
 });
 
 it.each([0, 8, 16])(

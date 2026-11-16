@@ -1,3 +1,4 @@
+import { parseFailureFromCause } from "../domain/parseFailure.js";
 import { binaryMetadataArchitecture } from "../domain/binaryMetadataArchitecture.js";
 import {
   IL2CPP_SLICE_SELECTORS,
@@ -12,26 +13,24 @@ import {
   isZeroFilledSpan,
   type BinaryContainer,
   type FileMappingIndex,
-} from "../native/metadata/BinaryContainer.js";
-import { readBinaryContainer } from "../native/metadata/readBinaryContainer.js";
+} from "../domain/binaryContainer.js";
+import { readBinaryContainer } from "../domain/native/readBinaryContainer.js";
 import {
   requireSelectedNativeImage,
   type SelectedNativeImage,
   type SliceSelectionInput,
-} from "../native/metadata/MachoSliceSelection.js";
+  selectMachoSlice,
+} from "../domain/apple/machoSliceSelection.js";
 import {
   parsePointerFixupsSteps,
   type PointerFixups,
-} from "../native/AppleMachoFixups.js";
-import {
-  parseMachoLayout,
-  UnsupportedMachoMetadataFormatError,
-} from "../native/AppleMachoSelection.js";
+} from "../domain/apple/appleMachoFixups.js";
+import { parseMachoLayout } from "../domain/apple/appleMachoSelection.js";
 import {
   readElfPointerValuesSteps,
   ElfPointerRelocationFailure,
   type ElfVirtualPointerWrites,
-} from "../native/metadata/ElfPointerRelocations.js";
+} from "../domain/native/elfPointerRelocations.js";
 import {
   Il2cppBinaryFormatFailure,
   IL2CPP_BINARY_BYTES,
@@ -92,6 +91,8 @@ export function* openImageSteps(image: Buffer): Generator<void, NativeImage> {
       throw new Il2cppBinaryFormatFailure(
         "native-index-capacity",
         cause.message,
+        cause.failure.limit.maximum,
+        "bytes",
       );
     if (cause instanceof BinaryFormatFailure)
       throw new Il2cppBinaryFormatFailure(
@@ -121,10 +122,20 @@ export function* openImageSteps(image: Buffer): Generator<void, NativeImage> {
           zeroFills: container.zero_fills,
         },
         IL2CPP_BINARY_BYTES,
+        { symbolResolution: "image-definitions" },
       );
   } catch (cause) {
-    if (cause instanceof ElfPointerRelocationFailure)
-      throw new Il2cppBinaryFormatFailure(cause.reason, cause.message);
+    if (cause instanceof ElfPointerRelocationFailure) {
+      if (cause.failure.kind === "limit" && cause.unit !== undefined)
+        throw new Il2cppBinaryFormatFailure(
+          "native-index-capacity",
+          cause.message,
+          cause.failure.limit.maximum,
+          cause.unit,
+        );
+      if (cause.reason !== "native-index-capacity")
+        throw new Il2cppBinaryFormatFailure(cause.reason, cause.message);
+    }
     if (cause instanceof BinaryFormatFailure)
       throw new Il2cppBinaryFormatFailure("malformed-container", cause.message);
     throw cause;
@@ -136,12 +147,24 @@ export function* openImageSteps(image: Buffer): Generator<void, NativeImage> {
     );
   let machoPointerFixups: PointerFixups | undefined;
   if (container.format === "macho") {
-    try {
-      const layout = parseMachoLayout(
-        image,
+    const selected = selectMachoSlice(image, {
+      mode: "admitted",
+      architecture:
         binaryMetadataArchitecture(container.architecture) ??
-          container.architecture,
+        container.architecture,
+      slice: undefined,
+    });
+    // The image is the thin slice already selected; a refusal means the
+    // container's architecture names no CPU family this reader decodes.
+    if (!selected.ok)
+      throw new Il2cppBinaryFormatFailure(
+        selected.error.kind === "malformed"
+          ? "malformed-container"
+          : "unsupported-container",
+        selected.error.message,
       );
+    try {
+      const layout = parseMachoLayout(image, selected.value);
       machoPointerFixups = yield* parsePointerFixupsSteps(
         image,
         layout.fixups,
@@ -149,15 +172,13 @@ export function* openImageSteps(image: Buffer): Generator<void, NativeImage> {
         layout.baseAddress,
       );
     } catch (cause) {
-      if (cause instanceof UnsupportedMachoMetadataFormatError)
+      const failure = parseFailureFromCause(cause);
+      if (failure !== undefined)
         throw new Il2cppBinaryFormatFailure(
-          "unsupported-container",
-          cause.message,
-        );
-      if (cause instanceof RangeError || cause instanceof TypeError)
-        throw new Il2cppBinaryFormatFailure(
-          "malformed-container",
-          cause.message,
+          failure.kind === "unsupported"
+            ? "unsupported-container"
+            : "malformed-container",
+          failure.message,
         );
       throw cause;
     }
