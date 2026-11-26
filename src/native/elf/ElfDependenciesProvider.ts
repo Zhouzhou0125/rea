@@ -5,7 +5,7 @@ import {
 } from "../../domain/parseFailureAnalysisError.js";
 import { decodeLimit } from "../../domain/parseFailure.js";
 import {
-  projectArtifactCloseFailure,
+  closeArtifactResources,
   projectStableArtifactFailure,
   withStableArtifactHandle,
   artifactFilePrimaryFacts,
@@ -26,10 +26,6 @@ import {
 } from "../../domain/native/elfDependencies.js";
 import { err, ok } from "../../domain/result.js";
 import { ELF_DEPENDENCIES_PROVIDER } from "../../domain/investigationProviders.js";
-import {
-  BinaryResourceFailure,
-  binaryResourceCeiling,
-} from "../../domain/binaryContainer.js";
 import { parseElfDependenciesFromHandle } from "./ElfDependencyParser.js";
 
 const OPERATION = "inspect_elf_dependencies";
@@ -44,16 +40,12 @@ export class ElfDependenciesProvider {
   readonly identity = ELF_DEPENDENCIES_PROVIDER;
   readonly #resources = new ArtifactResourceScope();
 
-  async close(): Promise<void> {
-    try {
-      await this.#resources.close();
-    } catch (cause: unknown) {
-      throw projectArtifactCloseFailure(
-        cause,
-        ELF_DEPENDENCIES_PROVIDER.id,
-        OPERATION,
-      );
-    }
+  close(): Promise<void> {
+    return closeArtifactResources(
+      () => this.#resources.close(),
+      ELF_DEPENDENCIES_PROVIDER,
+      OPERATION,
+    );
   }
 
   async inspect(
@@ -83,11 +75,7 @@ export class ElfDependenciesProvider {
           async (handle) => {
             assertArtifactReadActive(options?.signal);
             const parsed = await parseElfDependenciesFromHandle(
-              {
-                size: handle.size,
-                prefix: handle.prefix,
-                readRange: (offset, length) => handle.readRange(offset, length),
-              },
+              handle,
               {
                 path: input.path,
                 sha256: handle.sha256,
@@ -133,17 +121,6 @@ const elfDependenciesFailure = (
       description: "ELF image",
       fallbackMessage: "ELF dependency inspection failed.",
       recognise: (failure) => {
-        if (failure instanceof BinaryResourceFailure)
-          return parseLimitConstraint(
-            OPERATION,
-            "memory",
-            failure,
-            fixedAllowanceOptions(
-              "The ELF structural decoding allowance",
-              "parser",
-              binaryResourceCeiling(failure),
-            ),
-          );
         if (isParseLimit(failure, "elf-dependencies")) {
           const limit = failure.failure.limit;
           const parameter = (
