@@ -54,9 +54,13 @@ reported. If a virtual table cannot be resolved, possible backing tables have
 ordinary tables remain selectable. Schema inventory does not execute views,
 triggers or arbitrary SQL.
 
-The exact table name `sqlite_schema` is also a supported read-only row source.
-SQLite's [`table_list`](https://www.sqlite.org/pragma.html#pragma_table_list)
-and `table_xinfo` pragmas establish its row-source type and columns. The
+The schema catalog is also a supported read-only row source. SQLite's
+[`table_list`](https://www.sqlite.org/pragma.html#pragma_table_list) and
+`table_xinfo` pragmas establish its row-source type and columns. Both the
+canonical `sqlite_schema` spelling and the documented `sqlite_master` alias
+resolve to it; the alias is the only alternative SQLite recognizes in every
+schema, so the TEMP-only `sqlite_temp_schema` and `sqlite_temp_master`
+spellings are not accepted for a non-TEMP database. The
 [schema catalog](https://www.sqlite.org/schematab.html) has no self-entry for
 `sqlite_schema`, so REA does not invent a declaration, SQL statement or root
 page for it in `schema.tables`.
@@ -143,7 +147,7 @@ files or creating workers; retry after an active inspection finishes. This
 bounds simultaneous input buffering and private snapshot/worker counts.
 
 The database and WAL together are limited to `producer_limits.input_bytes`,
-default 256 MiB (CLI `--producer-limits '{"input_bytes":536870912}'`). The
+default 2 GiB (CLI `--producer-limits '{"input_bytes":4294967296}'`). The
 snapshot is copied to private disk, so raising it costs disk, not memory, and
 applies on the next call without restart. SQLite values/records,
 SQL statements and the complete worker JSON reply each have a 16 MiB limit.
